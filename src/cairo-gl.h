@@ -88,6 +88,10 @@ cairo_gl_surface_get_height (cairo_surface_t *abstract_surface);
 cairo_public void
 cairo_gl_surface_swapbuffers (cairo_surface_t *surface);
 
+cairo_public void
+cairo_gl_device_set_thread_aware (cairo_device_t	*device,
+				  cairo_bool_t		 thread_aware);
+
 #if CAIRO_HAS_GLX_FUNCTIONS
 #include <GL/glx.h>
 
@@ -133,6 +137,12 @@ cairo_gl_surface_create_for_egl (cairo_device_t	*device,
 				 EGLSurface	 egl,
 				 int		 width,
 				 int		 height);
+
+cairo_public EGLDisplay
+cairo_egl_device_get_display (cairo_device_t *device);
+
+cairo_public EGLSurface
+cairo_egl_device_get_context (cairo_device_t *device);
 
 #endif
 

@@ -57,7 +57,7 @@ _cairo_composite_reduce_pattern (const cairo_pattern_t *src,
     if (dst->base.type == CAIRO_PATTERN_TYPE_SOLID)
 	return;
 
-    dst->base.filter = _cairo_pattern_analyze_filter (&dst->base, NULL),
+    dst->base.filter = _cairo_pattern_analyze_filter (&dst->base);
 
     tx = ty = 0;
     if (_cairo_matrix_is_pixman_translation (&dst->base.matrix,
@@ -130,6 +130,10 @@ _cairo_composite_rectangles_init_for_paint (cairo_composite_rectangles_t *extent
     if (_cairo_clip_is_all_clipped (extents->clip))
 	return CAIRO_INT_STATUS_NOTHING_TO_DO;
 
+    if (! _cairo_rectangle_intersect (&extents->unbounded,
+				      _cairo_clip_get_extents (extents->clip)))
+	return CAIRO_INT_STATUS_NOTHING_TO_DO;
+
     if (extents->source_pattern.base.type != CAIRO_PATTERN_TYPE_SOLID)
 	_cairo_pattern_sampled_area (&extents->source_pattern.base,
 				     &extents->bounded,
@@ -158,6 +162,17 @@ _cairo_composite_rectangles_intersect (cairo_composite_rectangles_t *extents,
     extents->clip = _cairo_clip_reduce_for_composite (clip, extents);
     if (_cairo_clip_is_all_clipped (extents->clip))
 	return CAIRO_INT_STATUS_NOTHING_TO_DO;
+
+    if (! _cairo_rectangle_intersect (&extents->unbounded,
+				      _cairo_clip_get_extents (extents->clip)))
+	return CAIRO_INT_STATUS_NOTHING_TO_DO;
+
+    if (! _cairo_rectangle_intersect (&extents->bounded,
+				      _cairo_clip_get_extents (extents->clip)) &&
+	extents->is_bounded & CAIRO_OPERATOR_BOUND_BY_MASK)
+    {
+	return CAIRO_INT_STATUS_NOTHING_TO_DO;
+    }
 
     if (extents->source_pattern.base.type != CAIRO_PATTERN_TYPE_SOLID)
 	_cairo_pattern_sampled_area (&extents->source_pattern.base,
@@ -219,6 +234,10 @@ _cairo_composite_rectangles_intersect_source_extents (cairo_composite_rectangles
     if (_cairo_clip_is_all_clipped (extents->clip))
 	return CAIRO_INT_STATUS_NOTHING_TO_DO;
 
+    if (! _cairo_rectangle_intersect (&extents->unbounded,
+				      _cairo_clip_get_extents (extents->clip)))
+	return CAIRO_INT_STATUS_NOTHING_TO_DO;
+
     if (extents->source_pattern.base.type != CAIRO_PATTERN_TYPE_SOLID)
 	_cairo_pattern_sampled_area (&extents->source_pattern.base,
 				     &extents->bounded,
@@ -277,6 +296,10 @@ _cairo_composite_rectangles_intersect_mask_extents (cairo_composite_rectangles_t
     if (_cairo_clip_is_all_clipped (extents->clip))
 	return CAIRO_INT_STATUS_NOTHING_TO_DO;
 
+    if (! _cairo_rectangle_intersect (&extents->unbounded,
+				      _cairo_clip_get_extents (extents->clip)))
+	return CAIRO_INT_STATUS_NOTHING_TO_DO;
+
     if (extents->source_pattern.base.type != CAIRO_PATTERN_TYPE_SOLID)
 	_cairo_pattern_sampled_area (&extents->source_pattern.base,
 				     &extents->bounded,
@@ -306,7 +329,6 @@ _cairo_composite_rectangles_init_for_mask (cairo_composite_rectangles_t *extents
     {
 	return CAIRO_INT_STATUS_NOTHING_TO_DO;
     }
-
 
     extents->original_mask_pattern = mask;
     _cairo_composite_reduce_pattern (mask, &extents->mask_pattern);
@@ -413,10 +435,11 @@ _cairo_composite_rectangles_init_for_glyphs (cairo_composite_rectangles_t *exten
     /* Computing the exact bbox and the overlap is expensive.
      * First perform a cheap test to see if the glyphs are all clipped out.
      */
-    if (extents->is_bounded & CAIRO_OPERATOR_BOUND_BY_MASK) {
+    if (extents->is_bounded & CAIRO_OPERATOR_BOUND_BY_MASK &&
 	_cairo_scaled_font_glyph_approximate_extents (scaled_font,
 						      glyphs, num_glyphs,
-						      &extents->mask);
+						      &extents->mask))
+    {
 	if (! _cairo_rectangle_intersect (&extents->bounded, &extents->mask))
 	    return CAIRO_INT_STATUS_NOTHING_TO_DO;
     }
@@ -427,6 +450,13 @@ _cairo_composite_rectangles_init_for_glyphs (cairo_composite_rectangles_t *exten
 						      overlap);
     if (unlikely (status))
 	return status;
+
+    if (overlap && *overlap &&
+	scaled_font->options.antialias == CAIRO_ANTIALIAS_NONE &&
+	_cairo_pattern_is_opaque_solid (&extents->source_pattern.base))
+    {
+	*overlap = FALSE;
+    }
 
     return _cairo_composite_rectangles_intersect (extents, clip);
 }

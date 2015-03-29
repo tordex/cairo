@@ -48,6 +48,7 @@
 #include "cairo-image-surface-inline.h"
 #include "cairo-paginated-private.h"
 #include "cairo-pattern-private.h"
+#include "cairo-pixman-private.h"
 #include "cairo-recording-surface-private.h"
 #include "cairo-region-private.h"
 #include "cairo-scaled-font-private.h"
@@ -103,7 +104,12 @@ _cairo_format_from_pixman_format (pixman_format_code_t pixman_format)
 	return CAIRO_FORMAT_A1;
     case PIXMAN_r5g6b5:
 	return CAIRO_FORMAT_RGB16_565;
+#if PIXMAN_VERSION >= PIXMAN_VERSION_ENCODE(0,22,0)
     case PIXMAN_r8g8b8a8: case PIXMAN_r8g8b8x8:
+#endif
+#if PIXMAN_VERSION >= PIXMAN_VERSION_ENCODE(0,27,2)
+    case PIXMAN_a8r8g8b8_sRGB:
+#endif
     case PIXMAN_a8b8g8r8: case PIXMAN_x8b8g8r8: case PIXMAN_r8g8b8:
     case PIXMAN_b8g8r8:   case PIXMAN_b5g6r5:
     case PIXMAN_a1r5g5b5: case PIXMAN_x1r5g5b5: case PIXMAN_a1b5g5r5:
@@ -120,7 +126,9 @@ _cairo_format_from_pixman_format (pixman_format_code_t pixman_format)
     case PIXMAN_a2b10g10r10:
     case PIXMAN_x2b10g10r10:
     case PIXMAN_a2r10g10b10:
+#if PIXMAN_VERSION >= PIXMAN_VERSION_ENCODE(0,22,0)
     case PIXMAN_x14r6g6b6:
+#endif
     default:
 	return CAIRO_FORMAT_INVALID;
     }
@@ -414,7 +422,7 @@ _cairo_image_surface_create_with_content (cairo_content_t	content,
  * <informalexample><programlisting>
  * int stride;
  * unsigned char *data;
- * #cairo_surface_t *surface;
+ * cairo_surface_t *surface;
  *
  * stride = cairo_format_stride_for_width (format, width);
  * data = malloc (stride * height);
@@ -723,7 +731,7 @@ _cairo_format_bits_per_pixel (cairo_format_t format)
     }
 }
 
-static cairo_surface_t *
+cairo_surface_t *
 _cairo_image_surface_create_similar (void	       *abstract_other,
 				     cairo_content_t	content,
 				     int		width,
@@ -767,7 +775,7 @@ _cairo_image_surface_snapshot (void *abstract_surface)
 	clone->transparency = image->transparency;
 	clone->color = image->color;
 
-	clone->owns_data = FALSE;
+	clone->owns_data = TRUE;
 	return &clone->base;
     }
 
@@ -794,7 +802,7 @@ _cairo_image_surface_snapshot (void *abstract_surface)
     return &clone->base;
 }
 
-cairo_surface_t *
+cairo_image_surface_t *
 _cairo_image_surface_map_to_image (void *abstract_other,
 				   const cairo_rectangle_int_t *extents)
 {
@@ -814,13 +822,16 @@ _cairo_image_surface_map_to_image (void *abstract_other,
 							other->stride);
 
     cairo_surface_set_device_offset (surface, -extents->x, -extents->y);
-    return surface;
+    return (cairo_image_surface_t *) surface;
 }
 
 cairo_int_status_t
 _cairo_image_surface_unmap_image (void *abstract_surface,
 				  cairo_image_surface_t *image)
 {
+    cairo_surface_finish (&image->base);
+    cairo_surface_destroy (&image->base);
+
     return CAIRO_INT_STATUS_SUCCESS;
 }
 
@@ -840,8 +851,9 @@ _cairo_image_surface_finish (void *abstract_surface)
     }
 
     if (surface->parent) {
-	cairo_surface_destroy (surface->parent);
+	cairo_surface_t *parent = surface->parent;
 	surface->parent = NULL;
+	cairo_surface_destroy (parent);
     }
 
     return CAIRO_STATUS_SUCCESS;
@@ -1085,6 +1097,61 @@ _cairo_image_surface_coerce_to_format (cairo_image_surface_t *surface,
     return clone;
 }
 
+cairo_image_surface_t *
+_cairo_image_surface_create_from_image (cairo_image_surface_t *other,
+					pixman_format_code_t format,
+					int x, int y,
+					int width, int height, int stride)
+{
+    cairo_image_surface_t *surface;
+    cairo_status_t status;
+    pixman_image_t *image;
+    void *mem = NULL;
+
+    status = other->base.status;
+    if (unlikely (status))
+	goto cleanup;
+
+    if (stride) {
+	mem = _cairo_malloc_ab (height, stride);
+	if (unlikely (mem == NULL)) {
+	    status = _cairo_error (CAIRO_STATUS_NO_MEMORY);
+	    goto cleanup;
+	}
+    }
+
+    image = pixman_image_create_bits (format, width, height, mem, stride);
+    if (unlikely (image == NULL)) {
+	status = _cairo_error (CAIRO_STATUS_NO_MEMORY);
+	goto cleanup_mem;
+    }
+
+    surface = (cairo_image_surface_t *)
+	_cairo_image_surface_create_for_pixman_image (image, format);
+    if (unlikely (surface->base.status)) {
+	status = surface->base.status;
+	goto cleanup_image;
+    }
+
+    pixman_image_composite32 (PIXMAN_OP_SRC,
+                              other->pixman_image, NULL, image,
+                              x, y,
+                              0, 0,
+                              0, 0,
+                              width, height);
+    surface->base.is_clear = FALSE;
+    surface->owns_data = mem != NULL;
+
+    return surface;
+
+cleanup_image:
+    pixman_image_unref (image);
+cleanup_mem:
+    free (mem);
+cleanup:
+    return (cairo_image_surface_t *) _cairo_surface_create_in_error (status);
+}
+
 cairo_image_transparency_t
 _cairo_image_analyze_transparency (cairo_image_surface_t *image)
 {
@@ -1201,4 +1268,54 @@ _cairo_image_analyze_color (cairo_image_surface_t      *image)
     }
 
     return image->color = CAIRO_IMAGE_IS_COLOR;
+}
+
+cairo_image_surface_t *
+_cairo_image_surface_clone_subimage (cairo_surface_t             *surface,
+				     const cairo_rectangle_int_t *extents)
+{
+    cairo_surface_t *image;
+    cairo_surface_pattern_t pattern;
+    cairo_status_t status;
+
+    image = cairo_surface_create_similar_image (surface,
+						_cairo_format_from_content (surface->content),
+						extents->width,
+						extents->height);
+    if (image->status)
+	return to_image_surface (image);
+
+    /* TODO: check me with non-identity device_transform. Should we
+     * clone the scaling, too? */
+    cairo_surface_set_device_offset (image,
+				     -extents->x,
+				     -extents->y);
+
+    _cairo_pattern_init_for_surface (&pattern, surface);
+    pattern.base.filter = CAIRO_FILTER_NEAREST;
+
+    status = _cairo_surface_paint (image,
+				   CAIRO_OPERATOR_SOURCE,
+				   &pattern.base,
+				   NULL);
+
+    _cairo_pattern_fini (&pattern.base);
+
+    if (unlikely (status))
+	goto error;
+
+    /* We use the parent as a flag during map-to-image/umap-image that the
+     * resultant image came from a fallback rather than as direct call
+     * to the backend's map_to_image(). Whilst we use it as a simple flag,
+     * we need to make sure the parent surface obeys the reference counting
+     * semantics and is consistent for all callers.
+     */
+    _cairo_image_surface_set_parent (to_image_surface (image),
+				     cairo_surface_reference (surface));
+
+    return to_image_surface (image);
+
+error:
+    cairo_surface_destroy (image);
+    return to_image_surface (_cairo_surface_create_in_error (status));
 }

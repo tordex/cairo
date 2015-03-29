@@ -63,6 +63,8 @@ _cairo_xlib_display_finish (void *abstract_display)
     cairo_xlib_display_t *display = abstract_display;
     Display *dpy = display->display;
 
+    _cairo_xlib_display_fini_shm (display);
+
     if (! cairo_device_acquire (&display->base)) {
 	cairo_xlib_error_func_t old_handler;
 
@@ -147,15 +149,18 @@ static const cairo_device_backend_t _cairo_xlib_device_backend = {
     _cairo_xlib_display_destroy,
 };
 
-
 static void _cairo_xlib_display_select_compositor (cairo_xlib_display_t *display)
 {
+#if 1
     if (display->render_major > 0 || display->render_minor >= 4)
 	display->compositor = _cairo_xlib_traps_compositor_get ();
     else if (display->render_major > 0 || display->render_minor >= 0)
 	display->compositor = _cairo_xlib_mask_compositor_get ();
     else
 	display->compositor = _cairo_xlib_core_compositor_get ();
+#else
+    display->compositor = _cairo_xlib_fallback_compositor_get ();
+#endif
 }
 
 /**
@@ -208,6 +213,13 @@ _cairo_xlib_device_create (Display *dpy)
 	goto UNLOCK;
     }
 
+    _cairo_device_init (&display->base, &_cairo_xlib_device_backend);
+
+    display->display = dpy;
+    cairo_list_init (&display->screens);
+    cairo_list_init (&display->fonts);
+    display->closed = FALSE;
+
     /* Xlib calls out to the extension close_display hooks in LIFO
      * order. So we have to ensure that all extensions that we depend
      * on in our close_display hook are properly initialized before we
@@ -235,23 +247,6 @@ _cairo_xlib_device_create (Display *dpy)
 
     _cairo_xlib_display_select_compositor (display);
 
-    codes = XAddExtension (dpy);
-    if (unlikely (codes == NULL)) {
-	device = _cairo_device_create_in_error (CAIRO_STATUS_NO_MEMORY);
-	free (display);
-	goto UNLOCK;
-    }
-
-    _cairo_device_init (&display->base, &_cairo_xlib_device_backend);
-
-    XESetCloseDisplay (dpy, codes->extension, _cairo_xlib_close_display);
-
-    cairo_device_reference (&display->base); /* add one for the CloseDisplay */
-    display->display = dpy;
-    cairo_list_init (&display->screens);
-    cairo_list_init (&display->fonts);
-    display->closed = FALSE;
-
     display->white = NULL;
     memset (display->alpha, 0, sizeof (display->alpha));
     memset (display->solid, 0, sizeof (display->solid));
@@ -262,6 +257,8 @@ _cairo_xlib_device_create (Display *dpy)
 	    sizeof (display->cached_xrender_formats));
 
     display->force_precision = -1;
+
+    _cairo_xlib_display_init_shm (display);
 
     /* Prior to Render 0.10, there is no protocol support for gradients and
      * we call function stubs instead, which would silently consume the drawing.
@@ -294,7 +291,7 @@ _cairo_xlib_device_create (Display *dpy)
      *
      *    1. The original bug that led to the buggy_repeat
      *    workaround. This was a bug that Owen Taylor investigated,
-     *    understood well, and characterized against carious X
+     *    understood well, and characterized against various X
      *    servers. Confirmed X servers with this bug include:
      *
      *		"XFree86" <= 40500000
@@ -318,7 +315,7 @@ _cairo_xlib_device_create (Display *dpy)
      *    safest to just blacklist all old-versioning-scheme X servers,
      *    (just using VendorRelease < 70000000), as buggy_repeat=TRUE.
      */
-    if (strstr (ServerVendor (dpy), "X.Org") != NULL) {
+    if (_cairo_xlib_vendor_is_xorg (dpy)) {
 	if (VendorRelease (dpy) >= 60700000) {
 	    if (VendorRelease (dpy) < 70000000)
 		display->buggy_repeat = TRUE;
@@ -345,6 +342,16 @@ _cairo_xlib_device_create (Display *dpy)
 	display->buggy_pad_reflect = TRUE;
     }
 
+    codes = XAddExtension (dpy);
+    if (unlikely (codes == NULL)) {
+	device = _cairo_device_create_in_error (CAIRO_STATUS_NO_MEMORY);
+	free (display);
+	goto UNLOCK;
+    }
+
+    XESetCloseDisplay (dpy, codes->extension, _cairo_xlib_close_display);
+    cairo_device_reference (&display->base); /* add one for the CloseDisplay */
+
     display->next = _cairo_xlib_display_list;
     _cairo_xlib_display_list = display;
 
@@ -365,7 +372,7 @@ _cairo_xlib_display_acquire (cairo_device_t *device, cairo_xlib_display_t **disp
         return status;
 
     *display = (cairo_xlib_display_t *) device;
-    return status;
+    return CAIRO_STATUS_SUCCESS;
 }
 
 XRenderPictFormat *
@@ -475,7 +482,7 @@ _cairo_xlib_display_get_xrender_format_for_pixman(cairo_xlib_display_t *display,
 #undef MASK
 
     /* XXX caching? */
-    return XRenderFindFormat(dpy, mask, &tmpl, 1);
+    return XRenderFindFormat(dpy, mask, &tmpl, 0);
 }
 
 XRenderPictFormat *
@@ -484,15 +491,9 @@ _cairo_xlib_display_get_xrender_format (cairo_xlib_display_t	*display,
 {
     XRenderPictFormat *xrender_format;
 
-#if ! ATOMIC_OP_NEEDS_MEMORY_BARRIER
-    xrender_format = display->cached_xrender_formats[format];
-    if (likely (xrender_format != NULL))
-	return xrender_format;
-#endif
-
     xrender_format = display->cached_xrender_formats[format];
     if (xrender_format == NULL) {
-	int pict_format;
+	int pict_format = PictStandardNUM;
 
 	switch (format) {
 	case CAIRO_FORMAT_A1:
@@ -515,9 +516,9 @@ _cairo_xlib_display_get_xrender_format (cairo_xlib_display_t	*display,
 	case CAIRO_FORMAT_ARGB32:
 	    pict_format = PictStandardARGB32; break;
 	}
-	if (!xrender_format)
-	    xrender_format = XRenderFindStandardFormat (display->display,
-		                                        pict_format);
+	if (pict_format != PictStandardNUM)
+	    xrender_format =
+		XRenderFindStandardFormat (display->display, pict_format);
 	display->cached_xrender_formats[format] = xrender_format;
     }
 
@@ -567,7 +568,7 @@ _cairo_xlib_display_has_gradients (cairo_device_t *device)
  *
  * Restricts all future Xlib surfaces for this devices to the specified version
  * of the RENDER extension. This function exists solely for debugging purpose.
- * It let's you find out how cairo would behave with an older version of
+ * It lets you find out how cairo would behave with an older version of
  * the RENDER extension.
  *
  * Use the special values -1 and -1 for disabling the RENDER extension.

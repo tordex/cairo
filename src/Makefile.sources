@@ -84,9 +84,12 @@ cairo_private = \
 	cairo-image-info-private.h \
 	cairo-image-surface-inline.h \
 	cairo-image-surface-private.h \
+	cairo-line-inline.h \
+	cairo-line-private.h \
 	cairo-list-inline.h \
 	cairo-list-private.h \
 	cairo-malloc-private.h \
+	cairo-mempool-private.h \
 	cairo-mutex-impl-private.h \
 	cairo-mutex-list-private.h \
 	cairo-mutex-private.h \
@@ -98,6 +101,7 @@ cairo_private = \
 	cairo-path-private.h \
 	cairo-pattern-inline.h \
 	cairo-pattern-private.h \
+	cairo-pixman-private.h \
 	cairo-private.h \
 	cairo-recording-surface-inline.h \
 	cairo-recording-surface-private.h \
@@ -174,10 +178,12 @@ cairo_sources = \
 	cairo-image-info.c \
 	cairo-image-source.c \
 	cairo-image-surface.c \
+	cairo-line.c \
 	cairo-lzw.c \
 	cairo-matrix.c \
 	cairo-mask-compositor.c \
 	cairo-mesh-pattern-rasterizer.c \
+	cairo-mempool.c \
 	cairo-misc.c \
 	cairo-mono-scan-converter.c \
 	cairo-mutex.c \
@@ -193,6 +199,7 @@ cairo_sources = \
 	cairo-path-stroke.c \
 	cairo-path-stroke-boxes.c \
 	cairo-path-stroke-polygon.c \
+	cairo-path-stroke-traps.c \
 	cairo-path-stroke-tristrip.c \
 	cairo-pattern.c \
 	cairo-pen.c \
@@ -311,6 +318,7 @@ cairo_xlib_sources = \
 	cairo-xlib-screen.c \
 	cairo-xlib-source.c \
 	cairo-xlib-surface.c \
+	cairo-xlib-surface-shm.c \
 	cairo-xlib-visual.c \
 	cairo-xlib-xcb-surface.c \
 	$(NULL)
@@ -327,9 +335,9 @@ cairo_xcb_sources = \
 		    cairo-xcb-screen.c \
 		    cairo-xcb-shm.c \
 		    cairo-xcb-surface.c \
-		    cairo-xcb-surface-cairo.c \
 		    cairo-xcb-surface-core.c \
 		    cairo-xcb-surface-render.c \
+		    cairo-xcb-resources.c \
 		    $(NULL)
 
 cairo_qt_headers = cairo-qt.h
