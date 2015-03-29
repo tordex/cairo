@@ -143,7 +143,7 @@ typedef struct _cairo_cogl_path_fill_meta {
      * and translations but not for different scales.
      *
      * one idea is to track the diagonal lenghts of a unit rectangle
-     * transformed through the original ctm use to tesselate the geometry
+     * transformed through the original ctm use to tessellate the geometry
      * so we can check what the lengths are for any new ctm to know if
      * this geometry is compatible.
      */
@@ -167,7 +167,7 @@ typedef struct _cairo_cogl_path_stroke_meta {
      * and translations but not for different scales.
      *
      * one idea is to track the diagonal lenghts of a unit rectangle
-     * transformed through the original ctm use to tesselate the geometry
+     * transformed through the original ctm use to tessellate the geometry
      * so we can check what the lengths are for any new ctm to know if
      * this geometry is compatible.
      */
@@ -805,7 +805,7 @@ _cairo_cogl_journal_flush (cairo_cogl_surface_t *surface)
 		_cairo_path_fixed_approximate_clip_extents (&path->path, &extents);
 
 		/* TODO - maintain a fifo of the last 10 used clips with cached
-		 * primitives to see if we can avoid tesselating the path and
+		 * primitives to see if we can avoid tessellating the path and
 		 * uploading the vertices...
 		 */
 #if 0
@@ -929,9 +929,13 @@ _cairo_cogl_journal_flush (cairo_cogl_surface_t *surface)
 }
 
 static cairo_status_t
-_cairo_cogl_surface_flush (void *abstract_surface)
+_cairo_cogl_surface_flush (void *abstract_surface,
+			   unsigned flags)
 {
     cairo_cogl_surface_t *surface = (cairo_cogl_surface_t *)abstract_surface;
+
+    if (flags)
+	return CAIRO_STATUS_SUCCESS;
 
     _cairo_cogl_journal_flush (surface);
 
@@ -1331,7 +1335,7 @@ _cairo_cogl_acquire_surface_texture (cairo_cogl_surface_t  *reference_surface,
 
     if (abstract_surface->device == reference_surface->base.device) {
 	cairo_cogl_surface_t *surface = (cairo_cogl_surface_t *)abstract_surface;
-	_cairo_cogl_surface_flush (surface);
+	_cairo_cogl_surface_flush (surface, 0);
 	return surface->texture ? cogl_object_ref (surface->texture) : NULL;
     }
 
@@ -2033,8 +2037,10 @@ _cairo_cogl_stroke_to_primitive (cairo_cogl_surface_t	    *surface,
 
     _cairo_traps_init (&traps);
 
-    status = _cairo_path_fixed_stroke_to_traps (path, style, ctm, ctm_inverse, tolerance,
-						&traps);
+    status = _cairo_path_fixed_stroke_polygon_to_traps (path, style,
+							ctm, ctm_inverse,
+							tolerance,
+							&traps);
     if (unlikely (status))
 	goto BAIL;
 
@@ -2783,7 +2789,7 @@ cairo_cogl_device_create (CoglContext *cogl_context)
 
 ERROR:
     g_free (dev);
-    return NULL;
+    return _cairo_device_create_in_error (CAIRO_STATUS_DEVICE_ERROR);
 }
 slim_hidden_def (cairo_cogl_device_create);
 

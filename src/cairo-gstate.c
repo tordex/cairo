@@ -814,10 +814,24 @@ _do_cairo_gstate_user_to_backend (cairo_gstate_t *gstate, double *x, double *y)
 }
 
 void
+_do_cairo_gstate_user_to_backend_distance (cairo_gstate_t *gstate, double *x, double *y)
+{
+    cairo_matrix_transform_distance (&gstate->ctm, x, y);
+    cairo_matrix_transform_distance (&gstate->target->device_transform, x, y);
+}
+
+void
 _do_cairo_gstate_backend_to_user (cairo_gstate_t *gstate, double *x, double *y)
 {
     cairo_matrix_transform_point (&gstate->target->device_transform_inverse, x, y);
     cairo_matrix_transform_point (&gstate->ctm_inverse, x, y);
+}
+
+void
+_do_cairo_gstate_backend_to_user_distance (cairo_gstate_t *gstate, double *x, double *y)
+{
+    cairo_matrix_transform_distance (&gstate->target->device_transform_inverse, x, y);
+    cairo_matrix_transform_distance (&gstate->ctm_inverse, x, y);
 }
 
 void
@@ -940,7 +954,7 @@ _cairo_gstate_copy_transformed_pattern (cairo_gstate_t  *gstate,
         surface = surface_pattern->surface;
 
 	if (_cairo_surface_has_device_transform (surface))
-	    _cairo_pattern_transform (pattern, &surface->device_transform);
+	    _cairo_pattern_pretransform (pattern, &surface->device_transform);
     }
 
     if (! _cairo_matrix_is_identity (ctm_inverse))
@@ -1141,6 +1155,8 @@ _cairo_gstate_stroke (cairo_gstate_t *gstate, cairo_path_fixed_t *path)
     cairo_stroke_style_t style;
     double dash[2];
     cairo_status_t status;
+    cairo_matrix_t aggregate_transform;
+    cairo_matrix_t aggregate_transform_inverse;
 
     status = _cairo_gstate_get_pattern_status (gstate->source);
     if (unlikely (status))
@@ -1157,8 +1173,15 @@ _cairo_gstate_stroke (cairo_gstate_t *gstate, cairo_path_fixed_t *path)
 
     assert (gstate->opacity == 1.0);
 
+    cairo_matrix_multiply (&aggregate_transform,
+                           &gstate->ctm,
+                           &gstate->target->device_transform);
+    cairo_matrix_multiply (&aggregate_transform_inverse,
+                           &gstate->target->device_transform_inverse,
+                           &gstate->ctm_inverse);
+
     memcpy (&style, &gstate->stroke_style, sizeof (gstate->stroke_style));
-    if (_cairo_stroke_style_dash_can_approximate (&gstate->stroke_style, &gstate->ctm, gstate->tolerance)) {
+    if (_cairo_stroke_style_dash_can_approximate (&gstate->stroke_style, &aggregate_transform, gstate->tolerance)) {
         style.dash = dash;
         _cairo_stroke_style_dash_approximate (&gstate->stroke_style, &gstate->ctm, gstate->tolerance,
 					      &style.dash_offset,
@@ -1173,8 +1196,8 @@ _cairo_gstate_stroke (cairo_gstate_t *gstate, cairo_path_fixed_t *path)
 				  &source_pattern.base,
 				  path,
 				  &style,
-				  &gstate->ctm,
-				  &gstate->ctm_inverse,
+				  &aggregate_transform,
+				  &aggregate_transform_inverse,
 				  gstate->tolerance,
 				  gstate->antialias,
 				  gstate->clip);
@@ -1221,12 +1244,12 @@ _cairo_gstate_in_stroke (cairo_gstate_t	    *gstate,
     _cairo_traps_init (&traps);
     _cairo_traps_limit (&traps, &limit, 1);
 
-    status = _cairo_path_fixed_stroke_to_traps (path,
-						&gstate->stroke_style,
-						&gstate->ctm,
-						&gstate->ctm_inverse,
-						gstate->tolerance,
-						&traps);
+    status = _cairo_path_fixed_stroke_polygon_to_traps (path,
+							&gstate->stroke_style,
+							&gstate->ctm,
+							&gstate->ctm_inverse,
+							gstate->tolerance,
+							&traps);
     if (unlikely (status))
 	goto BAIL;
 
@@ -1448,19 +1471,19 @@ _cairo_gstate_stroke_extents (cairo_gstate_t	 *gstate,
     }
 
     if (status == CAIRO_INT_STATUS_UNSUPPORTED) {
-	cairo_traps_t traps;
+	cairo_polygon_t polygon;
 
-	_cairo_traps_init (&traps);
-	status = _cairo_path_fixed_stroke_to_traps (path,
-						    &gstate->stroke_style,
-						    &gstate->ctm,
-						    &gstate->ctm_inverse,
-						    gstate->tolerance,
-						    &traps);
-	empty = traps.num_traps == 0;
+	_cairo_polygon_init (&polygon, NULL, 0);
+	status = _cairo_path_fixed_stroke_to_polygon (path,
+						      &gstate->stroke_style,
+						      &gstate->ctm,
+						      &gstate->ctm_inverse,
+						      gstate->tolerance,
+						      &polygon);
+	empty = polygon.num_edges == 0;
 	if (! empty)
-	    _cairo_traps_extents (&traps, &extents);
-	_cairo_traps_fini (&traps);
+	    extents = polygon.extents;
+	_cairo_polygon_fini (&polygon);
     }
     if (! empty) {
 	_cairo_gstate_extents_to_user_rectangle (gstate, &extents,
@@ -1819,6 +1842,7 @@ _cairo_gstate_ensure_scaled_font (cairo_gstate_t *gstate)
     cairo_status_t status;
     cairo_font_options_t options;
     cairo_scaled_font_t *scaled_font;
+    cairo_matrix_t font_ctm;
 
     if (gstate->scaled_font != NULL)
 	return gstate->scaled_font->status;
@@ -1830,9 +1854,13 @@ _cairo_gstate_ensure_scaled_font (cairo_gstate_t *gstate)
     cairo_surface_get_font_options (gstate->target, &options);
     cairo_font_options_merge (&options, &gstate->font_options);
 
+    cairo_matrix_multiply (&font_ctm,
+			   &gstate->ctm,
+			   &gstate->target->device_transform);
+
     scaled_font = cairo_scaled_font_create (gstate->font_face,
 				            &gstate->font_matrix,
-					    &gstate->ctm,
+					    &font_ctm,
 					    &options);
 
     status = cairo_scaled_font_status (scaled_font);
@@ -1982,6 +2010,7 @@ _cairo_gstate_show_text_glyphs (cairo_gstate_t		   *gstate,
     if (cairo_surface_has_show_text_glyphs (gstate->target) ||
 	_cairo_scaled_font_get_max_scale (gstate->scaled_font) <= 10240)
     {
+
 	if (info != NULL) {
 	    status = _cairo_surface_show_text_glyphs (gstate->target, op, pattern,
 						      info->utf8, info->utf8_len,

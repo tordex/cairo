@@ -149,23 +149,33 @@ _cairo_default_context_push_group (void *abstract_cr, cairo_content_t content)
     } else {
 	cairo_surface_t *parent_surface;
 	cairo_rectangle_int_t extents;
-	cairo_bool_t is_empty;
+	cairo_bool_t bounded, is_empty;
 
 	parent_surface = _cairo_gstate_get_target (cr->gstate);
 
+	if (unlikely (parent_surface->status))
+	    return parent_surface->status;
+	if (unlikely (parent_surface->finished))
+	    return _cairo_error (CAIRO_STATUS_SURFACE_FINISHED);
+
 	/* Get the extents that we'll use in creating our new group surface */
-	is_empty = _cairo_surface_get_extents (parent_surface, &extents);
+	bounded = _cairo_surface_get_extents (parent_surface, &extents);
 	if (clip)
+	    /* XXX: This assignment just fixes a compiler warning? */
 	    is_empty = _cairo_rectangle_intersect (&extents,
 						   _cairo_clip_get_extents (clip));
 
-	/* XXX unbounded surface creation */
-
-	group_surface = _cairo_surface_create_similar_solid (parent_surface,
-							     content,
-							     extents.width,
-							     extents.height,
-							     CAIRO_COLOR_TRANSPARENT);
+	if (!bounded) {
+	    /* XXX: Generic solution? */
+	    group_surface = cairo_recording_surface_create (content, NULL);
+	    extents.x = extents.y = 0;
+	} else {
+	    group_surface = _cairo_surface_create_scratch (parent_surface,
+							   content,
+							   extents.width,
+							   extents.height,
+							   CAIRO_COLOR_TRANSPARENT);
+	}
 	status = group_surface->status;
 	if (unlikely (status))
 	    goto bail;
@@ -178,6 +188,10 @@ _cairo_default_context_push_group (void *abstract_cr, cairo_content_t content)
 	cairo_surface_set_device_offset (group_surface,
 					 parent_surface->device_transform.x0 - extents.x,
 					 parent_surface->device_transform.y0 - extents.y);
+
+	cairo_surface_set_device_scale (group_surface,
+					parent_surface->device_transform.xx,
+					parent_surface->device_transform.yy);
 
 	/* If we have a current path, we need to adjust it to compensate for
 	 * the device offset just applied. */
@@ -204,7 +218,8 @@ _cairo_default_context_pop_group (void *abstract_cr)
     cairo_default_context_t *cr = abstract_cr;
     cairo_surface_t *group_surface;
     cairo_pattern_t *group_pattern;
-    cairo_matrix_t group_matrix, device_transform_matrix;
+    cairo_surface_t *parent_surface;
+    cairo_matrix_t group_matrix;
     cairo_status_t status;
 
     /* Verify that we are at the right nesting level */
@@ -218,29 +233,21 @@ _cairo_default_context_pop_group (void *abstract_cr)
     status = _cairo_gstate_restore (&cr->gstate, &cr->gstate_freelist);
     assert (status == CAIRO_STATUS_SUCCESS);
 
+    parent_surface = _cairo_gstate_get_target (cr->gstate);
+
     group_pattern = cairo_pattern_create_for_surface (group_surface);
     status = group_pattern->status;
     if (unlikely (status))
         goto done;
 
     _cairo_gstate_get_matrix (cr->gstate, &group_matrix);
-    /* Transform by group_matrix centered around device_transform so that when
-     * we call _cairo_gstate_copy_transformed_pattern the result is a pattern
-     * with a matrix equivalent to the device_transform of group_surface. */
-    if (_cairo_surface_has_device_transform (group_surface)) {
-	cairo_pattern_set_matrix (group_pattern, &group_surface->device_transform);
-	_cairo_pattern_transform (group_pattern, &group_matrix);
-	_cairo_pattern_transform (group_pattern, &group_surface->device_transform_inverse);
-    } else {
-	cairo_pattern_set_matrix (group_pattern, &group_matrix);
-    }
+    cairo_pattern_set_matrix (group_pattern, &group_matrix);
 
     /* If we have a current path, we need to adjust it to compensate for
      * the device offset just removed. */
-    cairo_matrix_multiply (&device_transform_matrix,
-                           &_cairo_gstate_get_target (cr->gstate)->device_transform,
-			   &group_surface->device_transform_inverse);
-    _cairo_path_fixed_transform (cr->path, &device_transform_matrix);
+    _cairo_path_fixed_translate (cr->path,
+				 _cairo_fixed_from_int (parent_surface->device_transform.x0 - group_surface->device_transform.x0),
+				 _cairo_fixed_from_int (parent_surface->device_transform.y0 - group_surface->device_transform.y0));
 
 done:
     cairo_surface_destroy (group_surface);
@@ -621,6 +628,44 @@ _cairo_default_context_device_to_user_distance (void *abstract_cr,
     _cairo_gstate_device_to_user_distance (cr->gstate, dx, dy);
 }
 
+static void
+_cairo_default_context_backend_to_user (void *abstract_cr,
+					double *x,
+					double *y)
+{
+    cairo_default_context_t *cr = abstract_cr;
+
+    _cairo_gstate_backend_to_user (cr->gstate, x, y);
+}
+
+static void
+_cairo_default_context_backend_to_user_distance (void *abstract_cr, double *dx, double *dy)
+{
+    cairo_default_context_t *cr = abstract_cr;
+
+    _cairo_gstate_backend_to_user_distance (cr->gstate, dx, dy);
+}
+
+static void
+_cairo_default_context_user_to_backend (void *abstract_cr,
+					double *x,
+					double *y)
+{
+    cairo_default_context_t *cr = abstract_cr;
+
+    _cairo_gstate_user_to_backend (cr->gstate, x, y);
+}
+
+static void
+_cairo_default_context_user_to_backend_distance (void *abstract_cr,
+						 double *dx,
+						 double *dy)
+{
+    cairo_default_context_t *cr = abstract_cr;
+
+    _cairo_gstate_user_to_backend_distance (cr->gstate, dx, dy);
+}
+
 /* Path constructor */
 
 static cairo_status_t
@@ -748,7 +793,7 @@ _cairo_default_context_rel_move_to (void *abstract_cr, double dx, double dy)
     cairo_default_context_t *cr = abstract_cr;
     cairo_fixed_t dx_fixed, dy_fixed;
 
-    _cairo_gstate_user_to_device_distance (cr->gstate, &dx, &dy);
+    _cairo_gstate_user_to_backend_distance (cr->gstate, &dx, &dy);
 
     dx_fixed = _cairo_fixed_from_double (dx);
     dy_fixed = _cairo_fixed_from_double (dy);
@@ -762,7 +807,7 @@ _cairo_default_context_rel_line_to (void *abstract_cr, double dx, double dy)
     cairo_default_context_t *cr = abstract_cr;
     cairo_fixed_t dx_fixed, dy_fixed;
 
-    _cairo_gstate_user_to_device_distance (cr->gstate, &dx, &dy);
+    _cairo_gstate_user_to_backend_distance (cr->gstate, &dx, &dy);
 
     dx_fixed = _cairo_fixed_from_double (dx);
     dy_fixed = _cairo_fixed_from_double (dy);
@@ -782,9 +827,9 @@ _cairo_default_context_rel_curve_to (void *abstract_cr,
     cairo_fixed_t dx2_fixed, dy2_fixed;
     cairo_fixed_t dx3_fixed, dy3_fixed;
 
-    _cairo_gstate_user_to_device_distance (cr->gstate, &dx1, &dy1);
-    _cairo_gstate_user_to_device_distance (cr->gstate, &dx2, &dy2);
-    _cairo_gstate_user_to_device_distance (cr->gstate, &dx3, &dy3);
+    _cairo_gstate_user_to_backend_distance (cr->gstate, &dx1, &dy1);
+    _cairo_gstate_user_to_backend_distance (cr->gstate, &dx2, &dy2);
+    _cairo_gstate_user_to_backend_distance (cr->gstate, &dx3, &dy3);
 
     dx1_fixed = _cairo_fixed_from_double (dx1);
     dy1_fixed = _cairo_fixed_from_double (dy1);
@@ -1321,10 +1366,16 @@ static const cairo_backend_t _cairo_default_context_backend = {
     _cairo_default_context_set_matrix,
     _cairo_default_context_set_identity_matrix,
     _cairo_default_context_get_matrix,
+
     _cairo_default_context_user_to_device,
     _cairo_default_context_user_to_device_distance,
     _cairo_default_context_device_to_user,
     _cairo_default_context_device_to_user_distance,
+
+    _cairo_default_context_user_to_backend,
+    _cairo_default_context_user_to_backend_distance,
+    _cairo_default_context_backend_to_user,
+    _cairo_default_context_backend_to_user_distance,
 
     _cairo_default_context_new_path,
     _cairo_default_context_new_sub_path,

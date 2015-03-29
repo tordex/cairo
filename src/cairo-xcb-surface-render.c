@@ -37,6 +37,7 @@
 #include "cairo-clip-inline.h"
 #include "cairo-clip-private.h"
 #include "cairo-composite-rectangles-private.h"
+#include "cairo-image-surface-inline.h"
 #include "cairo-image-surface-private.h"
 #include "cairo-list-inline.h"
 #include "cairo-region-private.h"
@@ -46,6 +47,7 @@
 #include "cairo-traps-private.h"
 #include "cairo-recording-surface-inline.h"
 #include "cairo-paginated-private.h"
+#include "cairo-pattern-inline.h"
 
 #define PIXMAN_MAX_INT ((pixman_fixed_1 >> 1) - pixman_fixed_e) /* need to ensure deltas also fit */
 
@@ -392,11 +394,6 @@ _pattern_is_supported (uint32_t flags,
     if (pattern->type == CAIRO_PATTERN_TYPE_SOLID)
 	return TRUE;
 
-    if (! _cairo_matrix_is_integer_translation (&pattern->matrix, NULL, NULL)) {
-	if ((flags & CAIRO_XCB_RENDER_HAS_PICTURE_TRANSFORM) == 0)
-	    return FALSE;
-    }
-
     switch (pattern->extend) {
     default:
 	ASSERT_NOT_REACHED;
@@ -410,19 +407,22 @@ _pattern_is_supported (uint32_t flags,
     }
 
     if (pattern->type == CAIRO_PATTERN_TYPE_SURFACE) {
-	cairo_filter_t filter;
-
-	filter = pattern->filter;
-	if (_cairo_matrix_has_unity_scale (&pattern->matrix) &&
-	    _cairo_matrix_is_integer_translation (&pattern->matrix, NULL, NULL))
-	{
-	    filter = CAIRO_FILTER_NEAREST;
+	switch (pattern->filter) {
+	case CAIRO_FILTER_FAST:
+	case CAIRO_FILTER_NEAREST:
+	    return (flags & CAIRO_XCB_RENDER_HAS_PICTURE_TRANSFORM) ||
+		_cairo_matrix_is_integer_translation (&pattern->matrix, NULL, NULL);
+	case CAIRO_FILTER_GOOD:
+	    return flags & CAIRO_XCB_RENDER_HAS_FILTER_GOOD;
+	case CAIRO_FILTER_BEST:
+	    return flags & CAIRO_XCB_RENDER_HAS_FILTER_BEST;
+	case CAIRO_FILTER_BILINEAR:
+	case CAIRO_FILTER_GAUSSIAN:
+	default:
+	    return flags & CAIRO_XCB_RENDER_HAS_FILTERS;
 	}
-
-	if (! (filter == CAIRO_FILTER_NEAREST || filter == CAIRO_FILTER_FAST)) {
-	    if ((flags & CAIRO_XCB_RENDER_HAS_FILTERS) == 0)
-		return FALSE;
-	}
+    } else if (pattern->type == CAIRO_PATTERN_TYPE_MESH) {
+	return FALSE;
     } else { /* gradient */
 	if ((flags & CAIRO_XCB_RENDER_HAS_GRADIENTS) == 0)
 	    return FALSE;
@@ -434,9 +434,8 @@ _pattern_is_supported (uint32_t flags,
 	{
 	    return FALSE;
 	}
+	return TRUE;
     }
-
-    return pattern->type != CAIRO_PATTERN_TYPE_MESH;
 }
 
 static void
@@ -1032,9 +1031,7 @@ _cairo_xcb_surface_setup_surface_picture(cairo_xcb_picture_t *picture,
 
     filter = pattern->base.filter;
     if (filter != CAIRO_FILTER_NEAREST &&
-	_cairo_matrix_has_unity_scale (&pattern->base.matrix) &&
-	_cairo_fixed_is_integer (_cairo_fixed_from_double (pattern->base.matrix.x0)) &&
-	_cairo_fixed_is_integer (_cairo_fixed_from_double (pattern->base.matrix.y0)))
+        _cairo_matrix_is_pixel_exact (&pattern->base.matrix))
     {
 	filter = CAIRO_FILTER_NEAREST;
     }
@@ -1060,30 +1057,58 @@ record_to_picture (cairo_surface_t *target,
     cairo_status_t status;
     cairo_matrix_t matrix;
     cairo_surface_t *tmp;
-    cairo_surface_t *source = pattern->surface;
+    cairo_surface_t *source;
+    cairo_rectangle_int_t limit;
+    cairo_extend_t extend;
 
-    /* XXX: The following is more or less copied from cairo-xlibs-ource.c,
+    /* XXX: The following was once more or less copied from cairo-xlibs-ource.c,
      * record_source() and recording_pattern_get_surface(), can we share a
      * single version?
      */
 
-    /* First get the 'real' recording surface */
-    if (_cairo_surface_is_paginated (source))
-	source = _cairo_paginated_surface_get_recording (source);
-    if (_cairo_surface_is_snapshot (source))
-	source = _cairo_surface_snapshot_get_target (source);
+    /* First get the 'real' recording surface and figure out the size for tmp */
+    source = _cairo_pattern_get_source (pattern, &limit);
     assert (_cairo_surface_is_recording (source));
 
+    if (! _cairo_matrix_is_identity (&pattern->base.matrix)) {
+	double x1, y1, x2, y2;
+
+	matrix = pattern->base.matrix;
+	status = cairo_matrix_invert (&matrix);
+	assert (status == CAIRO_STATUS_SUCCESS);
+
+	x1 = limit.x;
+	y1 = limit.y;
+	x2 = limit.x + limit.width;
+	y2 = limit.y + limit.height;
+
+	_cairo_matrix_transform_bounding_box (&matrix,
+					      &x1, &y1, &x2, &y2, NULL);
+
+	limit.x = floor (x1);
+	limit.y = floor (y1);
+	limit.width  = ceil (x2) - limit.x;
+	limit.height = ceil (y2) - limit.y;
+    }
+    extend = pattern->base.extend;
+    if (_cairo_rectangle_contains_rectangle (&limit, extents))
+	extend = CAIRO_EXTEND_NONE;
+    if (extend == CAIRO_EXTEND_NONE && ! _cairo_rectangle_intersect (&limit, extents))
+	return _cairo_xcb_transparent_picture ((cairo_xcb_surface_t *) target);
+
     /* Now draw the recording surface to an xcb surface */
-    tmp = _cairo_surface_create_similar_scratch (target,
-						 source->content,
-						 extents->width,
-						 extents->height);
+    tmp = _cairo_surface_create_scratch (target,
+                                         source->content,
+                                         limit.width,
+                                         limit.height,
+                                         CAIRO_COLOR_TRANSPARENT);
     if (tmp->status != CAIRO_STATUS_SUCCESS) {
 	return (cairo_xcb_picture_t *) tmp;
     }
 
-    cairo_matrix_init_translate (&matrix, extents->x, extents->y);
+    cairo_matrix_init_translate (&matrix, limit.x, limit.y);
+    cairo_matrix_multiply (&matrix, &matrix, &pattern->base.matrix);
+
     status = _cairo_recording_surface_replay_with_clip (source,
 							&matrix, tmp,
 							NULL);
@@ -1095,13 +1120,7 @@ record_to_picture (cairo_surface_t *target,
     /* Now that we have drawn this to an xcb surface, try again with that */
     _cairo_pattern_init_static_copy (&tmp_pattern.base, &pattern->base);
     tmp_pattern.surface = tmp;
-
-    if (extents->x | extents->y) {
-	cairo_matrix_t *pmatrix = &tmp_pattern.base.matrix;
-
-	cairo_matrix_init_translate (&matrix, -extents->x, -extents->y);
-	cairo_matrix_multiply (pmatrix, pmatrix, &matrix);
-    }
+    cairo_matrix_init_translate (&tmp_pattern.base.matrix, -limit.x, -limit.y);
 
     picture = _copy_to_picture ((cairo_xcb_surface_t *) tmp);
     if (picture->base.status == CAIRO_STATUS_SUCCESS)
@@ -1131,7 +1150,7 @@ _cairo_xcb_surface_picture (cairo_xcb_surface_t *target,
 
     if (source->type == CAIRO_SURFACE_TYPE_XCB)
     {
-	if (source->backend->type == CAIRO_SURFACE_TYPE_XCB) {
+	if (_cairo_surface_is_xcb(source)) {
 	    cairo_xcb_surface_t *xcb = (cairo_xcb_surface_t *) source;
 	    if (xcb->screen == target->screen && xcb->fallback == NULL) {
 		picture = _copy_to_picture ((cairo_xcb_surface_t *) source);
@@ -1327,7 +1346,7 @@ _render_fill_boxes (void			*abstract_dst,
 		    cairo_boxes_t		*boxes)
 {
     cairo_xcb_surface_t *dst = abstract_dst;
-    xcb_rectangle_t stack_xrects[CAIRO_STACK_ARRAY_LENGTH (sizeof (xcb_rectangle_t))];
+    xcb_rectangle_t stack_xrects[CAIRO_STACK_ARRAY_LENGTH (xcb_rectangle_t)];
     xcb_rectangle_t *xrects = stack_xrects;
     xcb_render_color_t render_color;
     int render_op = _render_operator (op);
@@ -1670,11 +1689,11 @@ get_clip_surface (const cairo_clip_t *clip,
     cairo_surface_t *surface;
     cairo_status_t status;
 
-    surface = _cairo_surface_create_similar_solid (&target->base,
-						   CAIRO_CONTENT_ALPHA,
-						   clip->extents.width,
-						   clip->extents.height,
-						   CAIRO_COLOR_WHITE);
+    surface = _cairo_surface_create_scratch (&target->base,
+					    CAIRO_CONTENT_ALPHA,
+					    clip->extents.width,
+					    clip->extents.height,
+					    CAIRO_COLOR_WHITE);
     if (unlikely (surface->status))
 	return (cairo_xcb_surface_t *) surface;
 
@@ -1929,7 +1948,7 @@ _clip_and_composite_combine (cairo_clip_t		*clip,
 {
     cairo_xcb_surface_t *tmp;
     cairo_xcb_surface_t *clip_surface;
-    int clip_x, clip_y;
+    int clip_x = 0, clip_y = 0;
     xcb_render_picture_t clip_picture;
     cairo_status_t status;
 
@@ -2225,7 +2244,7 @@ _cairo_xcb_surface_fixup_unbounded_with_mask (cairo_xcb_surface_t *dst,
 					      cairo_clip_t *clip)
 {
     cairo_xcb_surface_t *mask;
-    int mask_x, mask_y;
+    int mask_x = 0, mask_y = 0;
 
     mask = get_clip_surface (clip, dst, &mask_x, &mask_y);
     if (unlikely (mask->base.status))
@@ -2362,10 +2381,15 @@ _cairo_xcb_surface_fixup_unbounded_boxes (cairo_xcb_surface_t *dst,
     }
 
     if (likely (status == CAIRO_STATUS_SUCCESS)) {
-	status = _render_fill_boxes (dst,
-				     CAIRO_OPERATOR_CLEAR,
-				     CAIRO_COLOR_TRANSPARENT,
-				     &clear);
+	if (dst->connection->flags & CAIRO_XCB_RENDER_HAS_FILL_RECTANGLES)
+	    status = _render_fill_boxes (dst,
+					 CAIRO_OPERATOR_CLEAR,
+					 CAIRO_COLOR_TRANSPARENT,
+					 &clear);
+	else
+	    status = _cairo_xcb_surface_core_fill_boxes (dst,
+							 CAIRO_COLOR_TRANSPARENT,
+							 &clear);
     }
 
     _cairo_boxes_fini (&clear);
@@ -2388,7 +2412,7 @@ _cairo_xcb_surface_clear (cairo_xcb_surface_t *dst)
     rect.width  = dst->width;
     rect.height = dst->height;
 
-    if (dst->connection->flags & CAIRO_XCB_RENDER_HAS_COMPOSITE) {
+    if (dst->connection->flags & CAIRO_XCB_RENDER_HAS_FILL_RECTANGLES) {
 	xcb_render_color_t color;
 	uint8_t op;
 
@@ -2623,7 +2647,7 @@ _composite_boxes (cairo_xcb_surface_t *dst,
 
 	if (need_clip_mask) {
 	    cairo_xcb_surface_t *clip_surface;
-	    int clip_x, clip_y;
+	    int clip_x = 0, clip_y = 0;
 
 	    clip_surface = get_clip_surface (extents->clip, dst,
 					     &clip_x, &clip_y);
@@ -2761,7 +2785,7 @@ _upload_image_inplace (cairo_xcb_surface_t *surface,
 	return CAIRO_INT_STATUS_UNSUPPORTED;
 
     pattern = (const cairo_surface_pattern_t *) source;
-    if (pattern->surface->type != CAIRO_SURFACE_TYPE_IMAGE)
+    if (! _cairo_surface_is_image (pattern->surface))
 	return CAIRO_INT_STATUS_UNSUPPORTED;
 
     /* Have we already upload this image to a pixmap? */
@@ -2876,27 +2900,29 @@ _boxes_for_traps (cairo_boxes_t *boxes,
 		  cairo_traps_t *traps,
 		  cairo_antialias_t antialias)
 {
-    int i;
+    int i, j;
 
     _cairo_boxes_init (boxes);
 
-    boxes->num_boxes    = traps->num_traps;
     boxes->chunks.base  = (cairo_box_t *) traps->traps;
-    boxes->chunks.count = traps->num_traps;
     boxes->chunks.size  = traps->num_traps;
 
     if (antialias != CAIRO_ANTIALIAS_NONE) {
-	for (i = 0; i < traps->num_traps; i++) {
+	for (i = j = 0; i < traps->num_traps; i++) {
 	    /* Note the traps and boxes alias so we need to take the local copies first. */
 	    cairo_fixed_t x1 = traps->traps[i].left.p1.x;
 	    cairo_fixed_t x2 = traps->traps[i].right.p1.x;
 	    cairo_fixed_t y1 = traps->traps[i].top;
 	    cairo_fixed_t y2 = traps->traps[i].bottom;
 
-	    boxes->chunks.base[i].p1.x = x1;
-	    boxes->chunks.base[i].p1.y = y1;
-	    boxes->chunks.base[i].p2.x = x2;
-	    boxes->chunks.base[i].p2.y = y2;
+	    if (x1 == x2 || y1 == y2)
+		    continue;
+
+	    boxes->chunks.base[j].p1.x = x1;
+	    boxes->chunks.base[j].p1.y = y1;
+	    boxes->chunks.base[j].p2.x = x2;
+	    boxes->chunks.base[j].p2.y = y2;
+	    j++;
 
 	    if (boxes->is_pixel_aligned) {
 		boxes->is_pixel_aligned =
@@ -2907,7 +2933,7 @@ _boxes_for_traps (cairo_boxes_t *boxes,
     } else {
 	boxes->is_pixel_aligned = TRUE;
 
-	for (i = 0; i < traps->num_traps; i++) {
+	for (i = j = 0; i < traps->num_traps; i++) {
 	    /* Note the traps and boxes alias so we need to take the local copies first. */
 	    cairo_fixed_t x1 = traps->traps[i].left.p1.x;
 	    cairo_fixed_t x2 = traps->traps[i].right.p1.x;
@@ -2915,12 +2941,18 @@ _boxes_for_traps (cairo_boxes_t *boxes,
 	    cairo_fixed_t y2 = traps->traps[i].bottom;
 
 	    /* round down here to match Pixman's behavior when using traps. */
-	    boxes->chunks.base[i].p1.x = _cairo_fixed_round_down (x1);
-	    boxes->chunks.base[i].p1.y = _cairo_fixed_round_down (y1);
-	    boxes->chunks.base[i].p2.x = _cairo_fixed_round_down (x2);
-	    boxes->chunks.base[i].p2.y = _cairo_fixed_round_down (y2);
+	    boxes->chunks.base[j].p1.x = _cairo_fixed_round_down (x1);
+	    boxes->chunks.base[j].p1.y = _cairo_fixed_round_down (y1);
+	    boxes->chunks.base[j].p2.x = _cairo_fixed_round_down (x2);
+	    boxes->chunks.base[j].p2.y = _cairo_fixed_round_down (y2);
+
+	    j += (boxes->chunks.base[j].p1.x != boxes->chunks.base[j].p2.x &&
+		  boxes->chunks.base[j].p1.y != boxes->chunks.base[j].p2.y);
 	}
     }
+
+    boxes->num_boxes    = j;
+    boxes->chunks.count = j;
 }
 
 static cairo_status_t
@@ -3084,7 +3116,8 @@ _clip_and_composite_boxes (cairo_xcb_surface_t *dst,
     }
 
     /* Can we reduce drawing through a clip-mask to simply drawing the clip? */
-    if (extents->clip->path != NULL && extents->is_bounded) {
+    if (dst->connection->flags & CAIRO_XCB_RENDER_HAS_COMPOSITE_TRAPEZOIDS &&
+	    extents->clip->path != NULL && extents->is_bounded) {
 	cairo_polygon_t polygon;
 	cairo_fill_rule_t fill_rule;
 	cairo_antialias_t antialias;
@@ -3092,6 +3125,9 @@ _clip_and_composite_boxes (cairo_xcb_surface_t *dst,
 
 	clip = _cairo_clip_copy (extents->clip);
 	clip = _cairo_clip_intersect_boxes (clip, boxes);
+	if (_cairo_clip_is_all_clipped (clip))
+		return CAIRO_INT_STATUS_NOTHING_TO_DO;
+
 	status = _cairo_clip_get_polygon (clip, &polygon,
 					  &fill_rule, &antialias);
 	_cairo_clip_path_destroy (clip->path);
@@ -3483,11 +3519,12 @@ _composite_opacity_boxes (void				*closure,
 /* high level rasteriser -> compositor */
 
 cairo_int_status_t
-_cairo_xcb_surface_render_paint (cairo_xcb_surface_t	*surface,
-				 cairo_operator_t	 op,
-				 const cairo_pattern_t	*source,
-				 cairo_composite_rectangles_t *composite)
+_cairo_xcb_render_compositor_paint (const cairo_compositor_t     *compositor,
+				    cairo_composite_rectangles_t *composite)
 {
+    cairo_xcb_surface_t *surface = (cairo_xcb_surface_t *) composite->surface;
+    cairo_operator_t op = composite->op;
+    cairo_pattern_t *source = &composite->source_pattern.base;
     cairo_boxes_t boxes;
     cairo_status_t status;
 
@@ -3520,12 +3557,13 @@ _cairo_xcb_surface_render_paint (cairo_xcb_surface_t	*surface,
 }
 
 cairo_int_status_t
-_cairo_xcb_surface_render_mask (cairo_xcb_surface_t	*surface,
-				cairo_operator_t	 op,
-				const cairo_pattern_t	*source,
-				const cairo_pattern_t	*mask,
-				cairo_composite_rectangles_t *composite)
+_cairo_xcb_render_compositor_mask (const cairo_compositor_t     *compositor,
+				   cairo_composite_rectangles_t *composite)
 {
+    cairo_xcb_surface_t *surface = (cairo_xcb_surface_t *) composite->surface;
+    cairo_operator_t op = composite->op;
+    cairo_pattern_t *source = &composite->source_pattern.base;
+    cairo_pattern_t *mask = &composite->mask_pattern.base;
     cairo_status_t status;
 
     if (unlikely (! _operator_is_supported (surface->connection->flags, op)))
@@ -3587,14 +3625,6 @@ _cairo_xcb_surface_render_stroke_as_polygon (cairo_xcb_surface_t	*dst,
     return status;
 }
 
-static void
-_clear_image (cairo_surface_t *surface)
-{
-    cairo_image_surface_t *image = (cairo_image_surface_t *) surface;
-    memset (image->data, 0, image->stride * image->height);
-    surface->is_clear = TRUE;
-}
-
 static cairo_status_t
 _cairo_xcb_surface_render_stroke_via_mask (cairo_xcb_surface_t		*dst,
 					   cairo_operator_t		 op,
@@ -3619,8 +3649,6 @@ _cairo_xcb_surface_render_stroke_via_mask (cairo_xcb_surface_t		*dst,
 						     extents->bounded.height);
     if (unlikely (image->status))
 	return image->status;
-
-    _clear_image (image);
 
     clip = _cairo_clip_copy_region (extents->clip);
     status = _cairo_surface_offset_stroke (image, x, y,
@@ -3651,17 +3679,18 @@ _cairo_xcb_surface_render_stroke_via_mask (cairo_xcb_surface_t		*dst,
 }
 
 cairo_int_status_t
-_cairo_xcb_surface_render_stroke (cairo_xcb_surface_t	*surface,
-				  cairo_operator_t	 op,
-				  const cairo_pattern_t	*source,
-				  const cairo_path_fixed_t	*path,
-				  const cairo_stroke_style_t	*style,
-				  const cairo_matrix_t	*ctm,
-				  const cairo_matrix_t	*ctm_inverse,
-				  double		 tolerance,
-				  cairo_antialias_t	 antialias,
-				  cairo_composite_rectangles_t *composite)
+_cairo_xcb_render_compositor_stroke (const cairo_compositor_t     *compositor,
+				     cairo_composite_rectangles_t *composite,
+				     const cairo_path_fixed_t     *path,
+				     const cairo_stroke_style_t   *style,
+				     const cairo_matrix_t         *ctm,
+				     const cairo_matrix_t         *ctm_inverse,
+				     double                        tolerance,
+				     cairo_antialias_t             antialias)
 {
+    cairo_xcb_surface_t *surface = (cairo_xcb_surface_t *) composite->surface;
+    cairo_operator_t op = composite->op;
+    cairo_pattern_t *source = &composite->source_pattern.base;
     cairo_int_status_t status;
 
     if (unlikely (! _operator_is_supported (surface->connection->flags, op)))
@@ -3761,8 +3790,6 @@ _cairo_xcb_surface_render_fill_via_mask (cairo_xcb_surface_t	*dst,
     if (unlikely (image->status))
 	return image->status;
 
-    _clear_image (image);
-
     clip = _cairo_clip_copy_region (extents->clip);
     status = _cairo_surface_offset_fill (image, x, y,
 					 CAIRO_OPERATOR_ADD,
@@ -3791,15 +3818,16 @@ _cairo_xcb_surface_render_fill_via_mask (cairo_xcb_surface_t	*dst,
 }
 
 cairo_int_status_t
-_cairo_xcb_surface_render_fill (cairo_xcb_surface_t	*surface,
-			       cairo_operator_t		 op,
-			       const cairo_pattern_t	*source,
-			       const cairo_path_fixed_t	*path,
-			       cairo_fill_rule_t	 fill_rule,
-			       double			 tolerance,
-			       cairo_antialias_t	 antialias,
-			       cairo_composite_rectangles_t *composite)
+_cairo_xcb_render_compositor_fill (const cairo_compositor_t     *compositor,
+				   cairo_composite_rectangles_t *composite,
+				   const cairo_path_fixed_t     *path,
+				   cairo_fill_rule_t             fill_rule,
+				   double                        tolerance,
+				   cairo_antialias_t             antialias)
 {
+    cairo_xcb_surface_t *surface = (cairo_xcb_surface_t *) composite->surface;
+    cairo_operator_t op = composite->op;
+    cairo_pattern_t *source = &composite->source_pattern.base;
     cairo_int_status_t status;
 
     if (unlikely (! _operator_is_supported (surface->connection->flags, op)))
@@ -3871,8 +3899,6 @@ _cairo_xcb_surface_render_glyphs_via_mask (cairo_xcb_surface_t		*dst,
 						     extents->bounded.height);
     if (unlikely (image->status))
 	return image->status;
-
-    _clear_image (image);
 
     clip = _cairo_clip_copy_region (extents->clip);
     status = _cairo_surface_offset_glyphs (image, x, y,
@@ -4147,10 +4173,8 @@ _cairo_xcb_font_close (cairo_xcb_font_t *font)
 
     scaled_font = font->scaled_font;
 
-    CAIRO_MUTEX_LOCK (scaled_font->mutex);
     //scaled_font->surface_private = NULL;
     _cairo_scaled_font_reset_cache (scaled_font);
-    CAIRO_MUTEX_UNLOCK (scaled_font->mutex);
 
     _cairo_xcb_font_destroy (font);
 }
@@ -4443,6 +4467,9 @@ _cairo_xcb_surface_add_glyph (cairo_xcb_connection_t *connection,
 	    const uint8_t *d;
 	    uint8_t *new, *n;
 
+	    if (c == 0)
+		break;
+
 	    new = malloc (c);
 	    if (unlikely (new == NULL)) {
 		status = _cairo_error (CAIRO_STATUS_NO_MEMORY);
@@ -4470,6 +4497,9 @@ _cairo_xcb_surface_add_glyph (cairo_xcb_connection_t *connection,
 	    unsigned int c = glyph_surface->stride * glyph_surface->height / 4;
 	    const uint32_t *d;
 	    uint32_t *new, *n;
+
+	    if (c == 0)
+		break;
 
 	    new = malloc (4 * c);
 	    if (unlikely (new == NULL)) {
@@ -4780,15 +4810,16 @@ _composite_glyphs (void				*closure,
 }
 
 cairo_int_status_t
-_cairo_xcb_surface_render_glyphs (cairo_xcb_surface_t	*surface,
-				  cairo_operator_t	 op,
-				  const cairo_pattern_t	*source,
-				  cairo_scaled_font_t	*scaled_font,
-				  cairo_glyph_t		*glyphs,
-				  int			 num_glyphs,
-				  cairo_composite_rectangles_t *composite,
-				  cairo_bool_t overlap)
+_cairo_xcb_render_compositor_glyphs (const cairo_compositor_t     *compositor,
+				     cairo_composite_rectangles_t *composite,
+				     cairo_scaled_font_t          *scaled_font,
+				     cairo_glyph_t                *glyphs,
+				     int                           num_glyphs,
+				     cairo_bool_t                  overlap)
 {
+    cairo_xcb_surface_t *surface = (cairo_xcb_surface_t *) composite->surface;
+    cairo_operator_t op = composite->op;
+    cairo_pattern_t *source = &composite->source_pattern.base;
     cairo_int_status_t status;
 
     if (unlikely (! _operator_is_supported (surface->connection->flags, op)))
